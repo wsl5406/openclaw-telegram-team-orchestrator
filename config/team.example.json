@@ -1,0 +1,58 @@
+{
+  "ownerNameEnv": "OWNER_DISPLAY_NAME",
+  "telegramGroupIdEnv": "TELEGRAM_GROUP_ID",
+  "routerProviderEnv": "ROUTER_PROVIDER",
+  "defaultRoleId": "lead",
+  "members": [
+    {
+      "id": "lead",
+      "displayName": "Team Lead",
+      "role": "lead",
+      "provider": "api2",
+      "openClawModel": "",
+      "tokenEnv": "TELEGRAM_TOKEN_LEAD",
+      "usernameEnv": "TELEGRAM_USERNAME_LEAD",
+      "aliases": ["负责人", "主管", "leader", "lead", "team lead", "coordinator", "manager", "队长", "协调"]
+    },
+    {
+      "id": "pm",
+      "displayName": "Product Manager",
+      "role": "pm",
+      "provider": "api1",
+      "openClawModel": "",
+      "tokenEnv": "TELEGRAM_TOKEN_PM",
+      "usernameEnv": "TELEGRAM_USERNAME_PM",
+      "aliases": ["产品经理", "产品", "需求", "PRD", "prd", "pm", "PM", "product manager", "product", "requirements", "requirement", "spec", "document", "docs", "文档"]
+    },
+    {
+      "id": "architect",
+      "displayName": "Architect",
+      "role": "architect",
+      "provider": "api1",
+      "openClawModel": "",
+      "tokenEnv": "TELEGRAM_TOKEN_ARCHITECT",
+      "usernameEnv": "TELEGRAM_USERNAME_ARCHITECT",
+      "aliases": ["架构师", "架构", "技术方案", "技术评审", "architect", "architecture", "system design", "technical design", "technical review", "review", "Reviewer"]
+    },
+    {
+      "id": "engineer",
+      "displayName": "Engineer",
+      "role": "engineer",
+      "provider": "api2",
+      "openClawModel": "",
+      "tokenEnv": "TELEGRAM_TOKEN_ENGINEER",
+      "usernameEnv": "TELEGRAM_USERNAME_ENGINEER",
+      "aliases": ["工程师", "开发", "写代码", "程序员", "实现", "落地", "修 bug", "engineer", "developer", "dev", "coder", "programmer", "implementation", "implement", "code", "fix bug"]
+    },
+    {
+      "id": "qa",
+      "displayName": "QA",
+      "role": "qa",
+      "provider": "api2",
+      "openClawModel": "",
+      "tokenEnv": "TELEGRAM_TOKEN_QA",
+      "usernameEnv": "TELEGRAM_USERNAME_QA",
+      "aliases": ["测试", "验收", "QA", "qa", "tester", "testing", "acceptance", "verification", "verify", "check", "review report", "test report", "data analysis", "检查", "验收报告", "数据分析"]
+    }
+  ]
+}

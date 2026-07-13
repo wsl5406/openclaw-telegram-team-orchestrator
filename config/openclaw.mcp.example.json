@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "local_files": {
+      "command": "python",
+      "args": ["C:/path/to/openclaw-telegram-team-orchestrator/mcp_servers/local_files_mcp.py"],
+      "env": {
+        "OPENCLAW_FILE_ROOTS": "C:\\;D:\\",
+        "OPENCLAW_FILE_MAX_READ": "200000"
+      }
+    },
+    "internet_research": {
+      "command": "python",
+      "args": ["C:/path/to/openclaw-telegram-team-orchestrator/mcp_servers/web_search_mcp.py"]
+    }
+  }
+}
