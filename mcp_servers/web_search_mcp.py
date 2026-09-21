@@ -206,17 +206,22 @@ def handle(req):
     return {}
 
 
-for line in sys.stdin:
-    line = line.lstrip("\ufeff").strip()
-    if not line:
-        continue
-    try:
-        req = json.loads(line)
-        if "id" not in req:
+def main():
+    for line in sys.stdin:
+        line = line.lstrip("\ufeff").strip()
+        if not line:
             continue
         try:
-            send({"jsonrpc": "2.0", "id": req["id"], "result": handle(req)})
+            req = json.loads(line)
+            if "id" not in req:
+                continue
+            try:
+                send({"jsonrpc": "2.0", "id": req["id"], "result": handle(req)})
+            except Exception as exc:
+                send({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": str(exc)}})
         except Exception as exc:
-            send({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": str(exc)}})
-    except Exception as exc:
-        send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}})
+            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}})
+
+
+if __name__ == "__main__":
+    main()

@@ -19,22 +19,97 @@ ROOTS = [
 MAX_READ = int(os.environ.get("OPENCLAW_FILE_MAX_READ", "200000"))
 DENY_PARTS = {
     ".git",
+    ".svn",
+    ".hg",
     ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".gcp",
+    ".kube",
+    ".docker",
+    ".config",
     "auth_info",
     "chrome_user_data",
     "cookies",
     "node_modules",
     "venv",
+    ".venv",
     "__pycache__",
+    "1password",
+    "bitwarden",
+    "keepass",
+    "keepassxc",
+    "lastpass",
+    "dashlane",
+    "backup",
+    "backups",
+    ".backup",
+    ".bak",
+    "credentials",
+    "google/chrome",
+    "mozilla/firefox",
+    "microsoft/edge",
+    "brave-browser",
+    "session storage",
+    "indexeddb",
+    "local storage",
 }
 DENY_NAMES = {
     ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    ".env.staging",
+    ".env.test",
+    ".bash_history",
+    ".zsh_history",
+    ".node_repl_history",
+    ".python_history",
+    "id_rsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_dsa",
+    "known_hosts",
+    "authorized_keys",
     "cookies",
     "history",
     "login data",
+    "web data",
     "secure preferences",
+    "credentials",
+    "credentials.json",
+    "service_account.json",
+    "shadow",
+    "passwd",
+    "sudoers",
+    "master.key",
 }
-DENY_SUFFIXES = {".key", ".pem", ".pfx", ".sqlite", ".db"}
+DENY_SUFFIXES = {
+    ".token",
+    ".secret",
+    ".credentials",
+    ".config",
+    ".bak",
+    ".backup",
+    ".key",
+    ".pem",
+    ".pfx",
+    ".p12",
+    ".pkcs12",
+    ".sqlite",
+    ".sqlite3",
+    ".db",
+    ".kdbx",
+    ".kdb",
+    ".rdp",
+    ".ovpn",
+    ".asc",
+    ".cer",
+    ".crt",
+    ".jks",
+    ".keystore",
+}
 POLICY = (
     "Read-only file access. No write, modify, move, rename, delete, or shell "
     "command tools are exposed by this MCP server."
@@ -74,7 +149,17 @@ def allowed_root_for(path):
 def is_sensitive(path):
     lower_parts = {part.lower() for part in path.parts}
     name = path.name.lower()
-    return bool(lower_parts & DENY_PARTS or name in DENY_NAMES or path.suffix.lower() in DENY_SUFFIXES)
+    suffix = path.suffix.lower()
+    if bool(lower_parts & DENY_PARTS):
+        return True
+    if name in DENY_NAMES:
+        return True
+    if suffix in DENY_SUFFIXES:
+        return True
+    # Check hidden sensitive files
+    if name.startswith(".") and any(k in name for k in ("env", "secret", "token", "cred", "pass", "key", "history", "ssh", "conf")):
+        return True
+    return False
 
 
 def checked_path(raw):
@@ -84,6 +169,15 @@ def checked_path(raw):
         raise ValueError(f"path outside read-only roots: {raw}")
     if is_sensitive(path):
         raise PermissionError(f"sensitive path is blocked: {raw}")
+    # Symlink target resolution check
+    try:
+        real_path = path.resolve(strict=False)
+        if not allowed_root_for(real_path):
+            raise ValueError(f"symlink target outside read-only roots: {raw}")
+        if is_sensitive(real_path):
+            raise PermissionError(f"symlink target is sensitive: {raw}")
+    except (OSError, RuntimeError) as exc:
+        raise PermissionError(f"failed to resolve path safety: {exc}")
     return path
 
 
@@ -203,17 +297,22 @@ def handle(req):
     return {}
 
 
-for line in sys.stdin:
-    line = line.lstrip("\ufeff").strip()
-    if not line:
-        continue
-    try:
-        req = json.loads(line)
-        if "id" not in req:
+def main():
+    for line in sys.stdin:
+        line = line.lstrip("\ufeff").strip()
+        if not line:
             continue
         try:
-            send({"jsonrpc": "2.0", "id": req["id"], "result": handle(req)})
+            req = json.loads(line)
+            if "id" not in req:
+                continue
+            try:
+                send({"jsonrpc": "2.0", "id": req["id"], "result": handle(req)})
+            except Exception as exc:
+                send({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": str(exc)}})
         except Exception as exc:
-            send({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32000, "message": str(exc)}})
-    except Exception as exc:
-        send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}})
+            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}})
+
+
+if __name__ == "__main__":
+    main()
