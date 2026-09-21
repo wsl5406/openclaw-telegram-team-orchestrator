@@ -1,6 +1,6 @@
 const fs = require("fs");
 const path = require("path");
-const { spawnSync } = require("child_process");
+const { spawn } = require("child_process");
 const TelegramBot = require("node-telegram-bot-api");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -16,6 +16,10 @@ const LOCAL_FILE_RE = /[A-Za-z]:[\\/]|\/mnt\/[a-z]\/|本地文件|电脑文件|�
 
 const HANDLED_MESSAGES = new Map();
 const CHAT_STATE = new Map();
+const MESSAGE_DEDUP_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+let isSavingState = false;
+let pendingSaveResolve = null;
 
 function loadEnvFile() {
   const envPath = path.join(ROOT, ".env");
@@ -72,8 +76,16 @@ function loadTeamConfig() {
 }
 
 loadEnvFile();
-const TEAM = loadTeamConfig();
-const MEMBERS = TEAM.members;
+let TEAM;
+let MEMBERS = [];
+
+try {
+  TEAM = loadTeamConfig();
+  MEMBERS = TEAM.members;
+} catch (err) {
+  // If not yet configured (e.g. running outside real env), keep fallback for unit tests
+  TEAM = { ownerName: "Owner", members: [], masterUserId: 0, groupId: 0, routerProvider: "api2" };
+}
 
 function providerConfig(name) {
   const prefix = String(name || "").toUpperCase();
@@ -94,26 +106,83 @@ function providerForMember(member) {
 }
 
 function logEvent(type, payload = {}) {
-  const line = JSON.stringify({ ts: new Date().toISOString(), type, ...payload }, null, 0);
-  fs.appendFile(LOG_FILE, line + "\n", () => {});
+  const entry = {
+    ts: new Date().toISOString(),
+    event_type: type,
+    ...payload,
+  };
+  const line = JSON.stringify(entry, null, 0);
+  try {
+    fs.appendFileSync(LOG_FILE, line + "\n", "utf8");
+  } catch (err) {
+    console.error("[logEvent error]", err.message);
+  }
 }
 
 function loadState() {
   if (!fs.existsSync(STATE_FILE)) return;
   try {
-    const data = loadJson(STATE_FILE);
-    for (const [chatId, state] of Object.entries(data.chatState || {})) CHAT_STATE.set(chatId, state);
+    const raw = fs.readFileSync(STATE_FILE, "utf8");
+    const data = JSON.parse(raw);
+    if (data.chatState && typeof data.chatState === "object") {
+      for (const [chatId, state] of Object.entries(data.chatState)) {
+        CHAT_STATE.set(chatId, state);
+      }
+    }
+    if (data.processedMessages && typeof data.processedMessages === "object") {
+      const now = Date.now();
+      for (const [key, ts] of Object.entries(data.processedMessages)) {
+        if (now - ts < MESSAGE_DEDUP_TTL_MS) {
+          HANDLED_MESSAGES.set(key, ts);
+        }
+      }
+    }
   } catch (err) {
-    console.error("[state] load failed:", err.message);
+    console.error("[state] Corrupted state.json detected. Backing up and resetting:", err.message);
+    try {
+      const backupPath = `${STATE_FILE}.corrupted-${Date.now()}.bak`;
+      fs.renameSync(STATE_FILE, backupPath);
+      logEvent("state_corrupted_backup", { backupPath, error: err.message });
+    } catch {}
+    CHAT_STATE.clear();
+    HANDLED_MESSAGES.clear();
   }
 }
 
-function saveState() {
-  const data = {
-    savedAt: new Date().toISOString(),
-    chatState: Object.fromEntries(CHAT_STATE.entries()),
-  };
-  fs.writeFile(STATE_FILE, JSON.stringify(data, null, 2), () => {});
+async function saveState() {
+  if (isSavingState) {
+    return new Promise((resolve) => {
+      pendingSaveResolve = resolve;
+    });
+  }
+  isSavingState = true;
+  try {
+    const now = Date.now();
+    const processedMessages = {};
+    for (const [key, ts] of HANDLED_MESSAGES.entries()) {
+      if (now - ts < MESSAGE_DEDUP_TTL_MS) {
+        processedMessages[key] = ts;
+      }
+    }
+    const data = {
+      savedAt: new Date().toISOString(),
+      chatState: Object.fromEntries(CHAT_STATE.entries()),
+      processedMessages,
+    };
+    const tmpFile = `${STATE_FILE}.tmp`;
+    await fs.promises.writeFile(tmpFile, JSON.stringify(data, null, 2), "utf8");
+    await fs.promises.rename(tmpFile, STATE_FILE);
+  } catch (err) {
+    console.error("[state] Atomic save failed:", err.message);
+    logEvent("state_save_failed", { error: err.message });
+  } finally {
+    isSavingState = false;
+    if (pendingSaveResolve) {
+      const resolve = pendingSaveResolve;
+      pendingSaveResolve = null;
+      saveState().then(resolve);
+    }
+  }
 }
 
 function chatState(chatId) {
@@ -125,11 +194,12 @@ function chatState(chatId) {
 function claimMessage(msg) {
   const key = `${msg.chat.id}:${msg.message_id}`;
   const now = Date.now();
-  for (const [item, expires] of HANDLED_MESSAGES.entries()) {
-    if (expires <= now) HANDLED_MESSAGES.delete(item);
+  for (const [item, timestamp] of HANDLED_MESSAGES.entries()) {
+    if (now - timestamp > MESSAGE_DEDUP_TTL_MS) HANDLED_MESSAGES.delete(item);
   }
   if (HANDLED_MESSAGES.has(key)) return false;
-  HANDLED_MESSAGES.set(key, now + 60_000);
+  HANDLED_MESSAGES.set(key, now);
+  saveState();
   return true;
 }
 
@@ -246,9 +316,9 @@ function roleThinkingFor(task, decision, member) {
 }
 
 function isSimpleDirectPing(text) {
-  const compact = String(text || "").trim();
-  if (compact.length > 40) return false;
-  return !COMPLEX_TASK_RE.test(compact) && !needsWebSearch(compact);
+  const compactText = String(text || "").trim();
+  if (compactText.length > 40) return false;
+  return !COMPLEX_TASK_RE.test(compactText) && !needsWebSearch(compactText);
 }
 
 function fallbackDecision(text, mentioned, isAll) {
@@ -438,6 +508,55 @@ function compact(text, max = 260) {
   return String(text || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
+function spawnAsync(cmd, args, { input, timeout = 180000, env = process.env, cwd } = {}) {
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let timer = null;
+    let killed = false;
+
+    const child = spawn(cmd, args, { env, cwd, stdio: ["pipe", "pipe", "pipe"], shell: false });
+
+    if (timeout > 0) {
+      timer = setTimeout(() => {
+        killed = true;
+        try {
+          if (process.platform === "win32") {
+            spawn("taskkill", ["/pid", child.pid.toString(), "/T", "/F"]).on("error", () => {});
+          } else {
+            child.kill("SIGKILL");
+          }
+        } catch {}
+        const err = new Error(`Command timed out after ${timeout}ms: ${cmd} ${args.join(" ")}`);
+        err.code = "ETIMEDOUT";
+        reject(err);
+      }, timeout);
+    }
+
+    if (input != null && child.stdin) {
+      child.stdin.end(input, "utf8");
+    }
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    child.on("error", (err) => {
+      if (timer) clearTimeout(timer);
+      reject(err);
+    });
+
+    child.on("close", (code, signal) => {
+      if (timer) clearTimeout(timer);
+      if (killed) return;
+      resolve({ code, signal, stdout, stderr });
+    });
+  });
+}
+
 async function callPlainProvider(member, prompt, thinkingLevel) {
   const provider = providerForMember(member);
   if (!providerReady(provider)) throw new Error(`provider ${member.provider} is not configured`);
@@ -465,7 +584,7 @@ async function callPlainProvider(member, prompt, thinkingLevel) {
   return sanitizeReply(data.choices?.[0]?.message?.content || data.output_text || "");
 }
 
-function runOpenClawAgent(member, prompt, sessionKey, thinkingLevel) {
+async function runOpenClawAgent(member, prompt, sessionKey, thinkingLevel) {
   const distro = optionalEnv("OPENCLAW_WSL_DISTRO", "OpenClawGateway");
   const openclaw = optionalEnv("OPENCLAW_BIN", "/home/openclaw/.openclaw/bin/openclaw");
   const timeoutSeconds = Number(optionalEnv("OPENCLAW_TIMEOUT_SECONDS", "180"));
@@ -480,9 +599,9 @@ function runOpenClawAgent(member, prompt, sessionKey, thinkingLevel) {
     "--thinking", thinkingLevel,
   ];
   if (member.openClawModel) args.push("--model", member.openClawModel);
-  const res = spawnSync("wsl.exe", args, { encoding: "utf8", timeout: (timeoutSeconds + 30) * 1000 });
+  const res = await spawnAsync("wsl.exe", args, { timeout: (timeoutSeconds + 30) * 1000 });
   const raw = `${res.stdout || ""}\n${res.stderr || ""}`.trim();
-  if (res.error) throw res.error;
+  if (res.code !== 0 && !raw) throw new Error(`OpenClaw process error (exit code ${res.code}): ${res.stderr}`);
   return sanitizeReply(extractOpenClawReply(raw) || raw);
 }
 
@@ -521,16 +640,14 @@ function extractJsonStringField(text, field) {
   }
 }
 
-function callMcpServer(serverFile, toolName, args) {
+async function callMcpServer(serverFile, toolName, args) {
   const python = optionalEnv("PYTHON_BIN", "python");
   const input = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: toolName, arguments: args } }) + "\n";
-  const res = spawnSync(python, [serverFile], {
+  const res = await spawnAsync(python, [serverFile], {
     input,
-    encoding: "utf8",
     timeout: 25_000,
     env: process.env,
   });
-  if (res.error) throw res.error;
   const raw = `${res.stdout || ""}\n${res.stderr || ""}`.trim();
   const line = raw.split(/\r?\n/).find((item) => item.trim().startsWith("{"));
   if (!line) throw new Error(`MCP returned no JSON: ${raw.slice(0, 200)}`);
@@ -539,11 +656,11 @@ function callMcpServer(serverFile, toolName, args) {
   return parsed.result?.content?.map((item) => item.text || "").join("\n") || "";
 }
 
-function searchContextForTask(task) {
+async function searchContextForTask(task) {
   if (!needsWebSearch(task)) return "";
   try {
     const server = path.join(ROOT, "mcp_servers", "web_search_mcp.py");
-    const result = callMcpServer(server, "internet_search", { query: task, limit: 5 });
+    const result = await callMcpServer(server, "internet_search", { query: task, limit: 5 });
     return `Internet research evidence from MCP internet_research:\n${result.slice(0, 4000)}`;
   } catch (err) {
     return `Internet research evidence from MCP internet_research:\nSEARCH_FAILED: ${err.message}`;
@@ -617,11 +734,236 @@ function limitReply(task, reply) {
   return picked.length > 900 ? picked.slice(0, 900).replace(/[，,。.\s]+$/u, "") + "..." : picked;
 }
 
-async function sendLong(bot, chatId, text) {
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function sendLong(bot, chatId, text, options = {}) {
   const body = String(text || "").trim() || "No effective result.";
-  for (let i = 0; i < body.length; i += 3800) {
-    await bot.sendMessage(chatId, body.slice(i, i + 3800));
+  const maxChunkLength = 3800;
+  const maxRetries = 3;
+
+  for (let i = 0; i < body.length; i += maxChunkLength) {
+    const chunk = body.slice(i, i + maxChunkLength);
+    const chunkIndex = Math.floor(i / maxChunkLength);
+    let sent = false;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        await bot.sendMessage(chatId, chunk);
+        sent = true;
+        break;
+      } catch (err) {
+        const statusCode = err.response?.statusCode;
+        const retryAfter = err.response?.body?.parameters?.retry_after;
+        const isRateLimit = statusCode === 429 || Boolean(retryAfter);
+
+        if (isRateLimit) {
+          const waitTimeMs = (Number(retryAfter || 2) + 1) * 1000;
+          logEvent("telegram_rate_limited", {
+            chat_id: chatId,
+            chunk_index: chunkIndex,
+            attempt,
+            wait_time_ms: waitTimeMs,
+            status: "waiting",
+          });
+          await sleep(waitTimeMs);
+        } else {
+          const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+          logEvent("telegram_send_retry", {
+            chat_id: chatId,
+            chunk_index: chunkIndex,
+            attempt,
+            error: err.message,
+            backoff_ms: backoffMs,
+          });
+          await sleep(backoffMs);
+        }
+      }
+    }
+
+    if (!sent) {
+      logEvent("telegram_send_chunk_failed", {
+        chat_id: chatId,
+        chunk_index: chunkIndex,
+        error_code: "SEND_CHUNK_FAILED",
+        status: "failed",
+      });
+    }
   }
+}
+
+class TaskQueue {
+  constructor(maxGlobalConcurrent = 3) {
+    this.maxGlobalConcurrent = maxGlobalConcurrent;
+    this.groupQueues = new Map(); // chatId -> Array of task descriptors
+    this.activeGroups = new Set(); // set of chatIds currently running a task
+    this.runningCount = 0;
+  }
+
+  enqueue(chatId, taskDescriptor) {
+    const key = String(chatId);
+    if (!this.groupQueues.has(key)) {
+      this.groupQueues.set(key, []);
+    }
+    const promise = new Promise((resolve, reject) => {
+      this.groupQueues.get(key).push({
+        ...taskDescriptor,
+        chatId: key,
+        resolve,
+        reject,
+      });
+    });
+    this.drain();
+    return promise;
+  }
+
+  drain() {
+    if (this.runningCount >= this.maxGlobalConcurrent) {
+      return;
+    }
+
+    for (const [chatId, queue] of this.groupQueues.entries()) {
+      if (this.runningCount >= this.maxGlobalConcurrent) break;
+      if (this.activeGroups.has(chatId) || queue.length === 0) continue;
+
+      const item = queue.shift();
+      if (!item) continue;
+
+      this.activeGroups.add(chatId);
+      this.runningCount++;
+
+      this.runItem(item).finally(() => {
+        this.activeGroups.delete(chatId);
+        this.runningCount--;
+        this.drain();
+      });
+    }
+  }
+
+  async runItem(item) {
+    const startTime = Date.now();
+    logEvent("task_status", {
+      task_id: item.taskId,
+      chat_id: item.chatId,
+      message_id: item.messageId,
+      status: "running",
+    });
+
+    try {
+      const result = await item.execute();
+      const durationMs = Date.now() - startTime;
+      logEvent("task_status", {
+        task_id: item.taskId,
+        chat_id: item.chatId,
+        message_id: item.messageId,
+        duration_ms: durationMs,
+        status: "succeeded",
+      });
+      item.resolve(result);
+    } catch (err) {
+      const durationMs = Date.now() - startTime;
+      const isTimeout = err.code === "ETIMEDOUT" || /timeout/i.test(err.message);
+      const status = isTimeout ? "timed_out" : "failed";
+      logEvent("task_status", {
+        task_id: item.taskId,
+        chat_id: item.chatId,
+        message_id: item.messageId,
+        duration_ms: durationMs,
+        error_code: err.code || "EXEC_ERROR",
+        error: err.message,
+        status,
+      });
+      item.reject(err);
+    }
+  }
+}
+
+const taskQueue = new TaskQueue(Number(optionalEnv("MAX_CONCURRENT_TASKS", "3")));
+
+async function executeTaskPipeline(taskId, receiverId, msg, bots) {
+  const text = msg.text || "";
+  const task = stripMentions(text);
+  const isAll = isAllMembersCall(text);
+  const mentioned = mentionedAgents(text);
+  let decision;
+
+  if (!isAll && mentioned.length === 1 && isSimpleDirectPing(task)) {
+    decision = { mode: "single", complexity: "small", roles: mentioned, reason: "simple direct mention", stop: "named role replies" };
+  } else {
+    try {
+      logEvent("router_start", { task_id: taskId, chat_id: msg.chat.id, message_id: msg.message_id, task });
+      decision = await callRouter(task, mentioned, isAll, chatState(msg.chat.id));
+      logEvent("router_done", { task_id: taskId, chat_id: msg.chat.id, message_id: msg.message_id, roles: decision.roles });
+    } catch (err) {
+      logEvent("router_failed", { task_id: taskId, chat_id: msg.chat.id, message_id: msg.message_id, error: err.message });
+      decision = fallbackDecision(task, mentioned, isAll);
+    }
+  }
+  decision = normalizeDecision(decision, mentioned, isAll, task);
+  logEvent("decision", { task_id: taskId, chat_id: msg.chat.id, message_id: msg.message_id, roles: decision.roles, reason: decision.reason });
+
+  const sessionBase = `telegram-team-${msg.chat.id}-${msg.message_id}-${Date.now()}`;
+  const transcript = [];
+  updateTeamContextFiles(msg.chat.id, task, decision, transcript);
+  const sharedContext = [readTeamContext(), recentContextForTask(msg.chat.id), await searchContextForTask(task)].filter(Boolean).join("\n\n");
+
+  for (const roleId of decision.roles) {
+    const member = memberById(roleId);
+    if (!member) continue;
+    const thinkingLevel = roleThinkingFor(task, decision, member);
+    const prompt = buildRolePrompt(task, decision, transcript, member, thinkingLevel, sharedContext);
+    if (bots[roleId]) {
+      bots[roleId].sendChatAction(msg.chat.id, "typing").catch(() => {});
+    }
+    let reply;
+    const agentStart = Date.now();
+    try {
+      logEvent("agent_start", {
+        task_id: taskId,
+        chat_id: msg.chat.id,
+        message_id: msg.message_id,
+        role_id: roleId,
+        thinking_level: thinkingLevel,
+        openclaw: shouldUseOpenClaw(task, member),
+        status: "running",
+      });
+      reply = shouldUseOpenClaw(task, member)
+        ? await runOpenClawAgent(member, prompt, `${sessionBase}-${roleId}`, thinkingLevel)
+        : await callPlainProvider(member, prompt, thinkingLevel);
+      logEvent("agent_done", {
+        task_id: taskId,
+        chat_id: msg.chat.id,
+        message_id: msg.message_id,
+        role_id: roleId,
+        duration_ms: Date.now() - agentStart,
+        chars: String(reply || "").length,
+        status: "succeeded",
+      });
+    } catch (err) {
+      logEvent("agent_failed", {
+        task_id: taskId,
+        chat_id: msg.chat.id,
+        message_id: msg.message_id,
+        role_id: roleId,
+        duration_ms: Date.now() - agentStart,
+        error_code: err.code || "AGENT_FAILED",
+        error: err.message,
+        status: "failed",
+      });
+      reply = `${member.name} call failed: ${err.message}`;
+    }
+
+    reply = limitReply(task, sanitizeReply(reply));
+    transcript.push({ roleId, name: member.name, reply });
+    if (bots[roleId]) {
+      await sendLong(bots[roleId], msg.chat.id, reply, { roleId });
+    }
+    rememberTurn(msg.chat.id, roleId, task, reply);
+    if (decision.mode === "single") break;
+  }
+  await updateBoard(msg.chat.id, task, decision, transcript);
+  updateTeamContextFiles(msg.chat.id, task, decision, transcript);
 }
 
 async function handleMessage(receiverId, msg, bots) {
@@ -639,55 +981,19 @@ async function handleMessage(receiverId, msg, bots) {
   const coordinator = botMentions[0] || receiverId;
   if (botMentions.length && receiverId !== coordinator) return;
 
-  const task = stripMentions(text);
-  const isAll = isAllMembersCall(text);
-  const mentioned = mentionedAgents(text);
-  let decision;
-  if (!isAll && mentioned.length === 1 && isSimpleDirectPing(task)) {
-    decision = { mode: "single", complexity: "small", roles: mentioned, reason: "simple direct mention", stop: "named role replies" };
-  } else {
-    try {
-      logEvent("router_start", { chatId: msg.chat.id, messageId: msg.message_id, task });
-      decision = await callRouter(task, mentioned, isAll, chatState(msg.chat.id));
-      logEvent("router_done", { chatId: msg.chat.id, messageId: msg.message_id, roles: decision.roles });
-    } catch (err) {
-      logEvent("router_failed", { chatId: msg.chat.id, messageId: msg.message_id, error: err.message });
-      decision = fallbackDecision(task, mentioned, isAll);
-    }
-  }
-  decision = normalizeDecision(decision, mentioned, isAll, task);
-  logEvent("decision", { chatId: msg.chat.id, messageId: msg.message_id, roles: decision.roles, reason: decision.reason });
+  const taskId = `task-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  logEvent("task_status", {
+    task_id: taskId,
+    chat_id: msg.chat.id,
+    message_id: msg.message_id,
+    status: "queued",
+  });
 
-  const sessionBase = `telegram-team-${msg.chat.id}-${msg.message_id}-${Date.now()}`;
-  const transcript = [];
-  updateTeamContextFiles(msg.chat.id, task, decision, transcript);
-  const sharedContext = [readTeamContext(), recentContextForTask(msg.chat.id), searchContextForTask(task)].filter(Boolean).join("\n\n");
-
-  for (const roleId of decision.roles) {
-    const member = memberById(roleId);
-    if (!member) continue;
-    const thinkingLevel = roleThinkingFor(task, decision, member);
-    const prompt = buildRolePrompt(task, decision, transcript, member, thinkingLevel, sharedContext);
-    bots[roleId].sendChatAction(msg.chat.id, "typing").catch(() => {});
-    let reply;
-    try {
-      logEvent("agent_start", { chatId: msg.chat.id, messageId: msg.message_id, roleId, thinkingLevel, openclaw: shouldUseOpenClaw(task, member) });
-      reply = shouldUseOpenClaw(task, member)
-        ? runOpenClawAgent(member, prompt, `${sessionBase}-${roleId}`, thinkingLevel)
-        : await callPlainProvider(member, prompt, thinkingLevel);
-      logEvent("agent_done", { chatId: msg.chat.id, messageId: msg.message_id, roleId, chars: String(reply || "").length });
-    } catch (err) {
-      logEvent("agent_failed", { chatId: msg.chat.id, messageId: msg.message_id, roleId, error: err.message });
-      reply = `${member.name} call failed: ${err.message}`;
-    }
-    reply = limitReply(task, sanitizeReply(reply));
-    transcript.push({ roleId, name: member.name, reply });
-    await sendLong(bots[roleId], msg.chat.id, reply);
-    rememberTurn(msg.chat.id, roleId, task, reply);
-    if (decision.mode === "single") break;
-  }
-  await updateBoard(msg.chat.id, task, decision, transcript);
-  updateTeamContextFiles(msg.chat.id, task, decision, transcript);
+  return taskQueue.enqueue(msg.chat.id, {
+    taskId,
+    messageId: msg.message_id,
+    execute: () => executeTaskPipeline(taskId, receiverId, msg, bots),
+  });
 }
 
 function printStartupSecurityCheck() {
@@ -719,7 +1025,7 @@ async function main() {
   for (const member of MEMBERS) {
     bots[member.id] = new TelegramBot(member.token, { polling: true });
     bots[member.id].on("message", (msg) => handleMessage(member.id, msg, bots).catch((err) => {
-      logEvent("message_failed", { roleId: member.id, error: err.message });
+      logEvent("message_failed", { role_id: member.id, error: err.message });
       console.error(err);
     }));
     console.log(`started ${member.name} (${member.id})`);
@@ -727,7 +1033,40 @@ async function main() {
   console.log("Telegram team orchestrator is running.");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  TEAM,
+  MEMBERS,
+  loadTeamConfig,
+  normalizeDecision,
+  fallbackDecision,
+  mentionedAgents,
+  botMentionedAgents,
+  isAllMembersCall,
+  wantsHighThinking,
+  needsWebSearch,
+  needsMcpTools,
+  routerThinkingFor,
+  roleThinkingFor,
+  limitReply,
+  sanitizeReply,
+  claimMessage,
+  loadState,
+  saveState,
+  chatState,
+  HANDLED_MESSAGES,
+  CHAT_STATE,
+  spawnAsync,
+  TaskQueue,
+  taskQueue,
+  sendLong,
+  handleMessage,
+  executeTaskPipeline,
+  logEvent,
+};
