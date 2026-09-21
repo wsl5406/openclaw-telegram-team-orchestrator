@@ -52,23 +52,20 @@ function loadTeamConfig() {
   const exampleFile = path.join(CONFIG_DIR, "team.example.json");
   const config = loadJson(fs.existsSync(configFile) ? configFile : exampleFile);
   const ownerName = optionalEnv(config.ownerNameEnv || "OWNER_DISPLAY_NAME", "Owner");
-  const members = config.members.map((member) => ({
+  const members = (config.members || []).map((member) => ({
     ...member,
-    name: member.displayName,
-    token: requiredEnv(member.tokenEnv),
+    name: member.displayName || member.name || member.id,
+    token: optionalEnv(member.tokenEnv, ""),
     username: optionalEnv(member.usernameEnv, member.username || ""),
     aliases: member.aliases || [],
   }));
-  const masterUserIdRaw = requiredEnv("MASTER_USER_ID");
-  if (!/^\d+$/.test(masterUserIdRaw.trim())) {
-    throw new Error(`MASTER_USER_ID must be a numeric Telegram user ID, got: ${masterUserIdRaw}`);
-  }
-  const masterUserId = Number(masterUserIdRaw.trim());
+  const masterUserIdRaw = optionalEnv("MASTER_USER_ID", "");
+  const masterUserId = masterUserIdRaw ? Number(masterUserIdRaw.trim()) : 0;
   return {
     ...config,
     ownerName,
     masterUserId,
-    groupId: requiredEnv(config.telegramGroupIdEnv || "TELEGRAM_GROUP_ID"),
+    groupId: optionalEnv(config.telegramGroupIdEnv || "TELEGRAM_GROUP_ID", ""),
     routerProvider: optionalEnv(config.routerProviderEnv || "ROUTER_PROVIDER", "api2"),
     defaultRoleId: config.defaultRoleId || members[0]?.id,
     members,
@@ -76,15 +73,21 @@ function loadTeamConfig() {
 }
 
 loadEnvFile();
-let TEAM;
-let MEMBERS = [];
+const TEAM = loadTeamConfig();
+const MEMBERS = TEAM.members;
 
-try {
-  TEAM = loadTeamConfig();
-  MEMBERS = TEAM.members;
-} catch (err) {
-  // If not yet configured (e.g. running outside real env), keep fallback for unit tests
-  TEAM = { ownerName: "Owner", members: [], masterUserId: 0, groupId: 0, routerProvider: "api2" };
+function validateStartupConfig() {
+  const masterUserIdRaw = requiredEnv("MASTER_USER_ID");
+  if (!/^\d+$/.test(masterUserIdRaw.trim())) {
+    throw new Error(`MASTER_USER_ID must be a numeric Telegram user ID, got: ${masterUserIdRaw}`);
+  }
+  TEAM.masterUserId = Number(masterUserIdRaw.trim());
+  TEAM.groupId = requiredEnv(TEAM.telegramGroupIdEnv || "TELEGRAM_GROUP_ID");
+  for (const member of MEMBERS) {
+    if (!member.token) {
+      member.token = requiredEnv(member.tokenEnv);
+    }
+  }
 }
 
 function providerConfig(name) {
@@ -336,7 +339,7 @@ function fallbackDecision(text, mentioned, isAll) {
     if (member.role === "engineer" && /代码|开发|实现|修|bug|接口|落地|部署|code|develop|developer|engineer|implement|implementation|fix|api|interface|deploy|build/iu.test(t)) roles.add(member.id);
     if (member.role === "qa" && /测试|验收|检查|报告|数据|验证|回归|QA|qa|test|testing|acceptance|verify|verification|check|report|data|regression/iu.test(t)) roles.add(member.id);
   }
-  if (!roles.size) roles.add(TEAM.defaultRoleId);
+  if (!roles.size && TEAM.defaultRoleId) roles.add(TEAM.defaultRoleId);
   const picked = [...roles].filter(Boolean).slice(0, 5);
   return {
     mode: picked.length > 1 ? "team" : "single",
@@ -741,7 +744,8 @@ async function sleep(ms) {
 async function sendLong(bot, chatId, text, options = {}) {
   const body = String(text || "").trim() || "No effective result.";
   const maxChunkLength = 3800;
-  const maxRetries = 3;
+  const maxRetries = options.maxRetries ?? 3;
+  const baseBackoffMs = options.baseBackoffMs ?? 1000;
 
   for (let i = 0; i < body.length; i += maxChunkLength) {
     const chunk = body.slice(i, i + maxChunkLength);
@@ -759,7 +763,7 @@ async function sendLong(bot, chatId, text, options = {}) {
         const isRateLimit = statusCode === 429 || Boolean(retryAfter);
 
         if (isRateLimit) {
-          const waitTimeMs = (Number(retryAfter || 2) + 1) * 1000;
+          const waitTimeMs = options.fastRetry ? 50 : (Number(retryAfter || 2) + 1) * 1000;
           logEvent("telegram_rate_limited", {
             chat_id: chatId,
             chunk_index: chunkIndex,
@@ -769,7 +773,7 @@ async function sendLong(bot, chatId, text, options = {}) {
           });
           await sleep(waitTimeMs);
         } else {
-          const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+          const backoffMs = options.fastRetry ? 10 : Math.min(baseBackoffMs * Math.pow(2, attempt - 1), 10000);
           logEvent("telegram_send_retry", {
             chat_id: chatId,
             chunk_index: chunkIndex,
@@ -1062,6 +1066,7 @@ function printStartupSecurityCheck() {
 }
 
 async function main() {
+  validateStartupConfig();
   loadState();
   ensureTeamContextDir();
   ensureStaticTeamContextFiles();
@@ -1089,6 +1094,7 @@ module.exports = {
   TEAM,
   MEMBERS,
   loadTeamConfig,
+  validateStartupConfig,
   normalizeDecision,
   fallbackDecision,
   mentionedAgents,

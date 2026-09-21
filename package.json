@@ -6,7 +6,8 @@
   "type": "commonjs",
   "scripts": {
     "start": "node src/openclaw_orchestrator.js",
-    "check": "node --check src/openclaw_orchestrator.js"
+    "check": "node --check src/openclaw_orchestrator.js",
+    "test": "node --test tests/**/*.test.js"
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.66.0"

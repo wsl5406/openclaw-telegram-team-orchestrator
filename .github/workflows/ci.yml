@@ -23,7 +23,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Check JavaScript syntax
         run: npm run check
@@ -31,6 +31,12 @@ jobs:
       - name: Check Python syntax
         run: python -m py_compile mcp_servers\local_files_mcp.py mcp_servers\web_search_mcp.py
 
+      - name: Run tests
+        run: npm test
+
       - name: Secret scan
         shell: pwsh
         run: .\scripts\secret_scan.ps1
+
+      - name: Dependency audit
+        run: npm audit --omit=dev || true

@@ -3,7 +3,6 @@
 !.env.example
 
 node_modules/
-package-lock.json
 
 orchestrator.log
 state.json
