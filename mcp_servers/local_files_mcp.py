@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
 import json
 import os
 import pathlib
 import re
 import sys
+import time
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -17,6 +17,9 @@ ROOTS = [
     if p.strip()
 ]
 MAX_READ = int(os.environ.get("OPENCLAW_FILE_MAX_READ", "200000"))
+MAX_SEARCH_FILES = int(os.environ.get("OPENCLAW_SEARCH_MAX_FILES", "2000"))
+MAX_SEARCH_BYTES = int(os.environ.get("OPENCLAW_SEARCH_MAX_BYTES", "20000000"))  # 20MB
+SEARCH_TIMEOUT_SECONDS = float(os.environ.get("OPENCLAW_SEARCH_TIMEOUT", "10.0"))
 DENY_PARTS = {
     ".git",
     ".svn",
@@ -203,6 +206,13 @@ def list_dir(args):
     for child in sorted(path.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower()))[:limit]:
         if is_sensitive(child):
             continue
+        try:
+            if child.is_symlink():
+                target = child.resolve(strict=False)
+                if not allowed_root_for(target) or is_sensitive(target):
+                    continue
+        except (OSError, RuntimeError):
+            continue
         rows.append(f"{'dir ' if child.is_dir() else 'file'} {display_path(child)}")
     return result_text("\n".join(rows) or "(empty)")
 
@@ -223,20 +233,49 @@ def search_files(args):
     limit = max(1, min(int(args.get("limit", 80)), 300))
     bases = [checked_path(args["path"])] if args.get("path") else [root for root in ROOTS if root.exists()]
     rows = []
+    files_scanned = 0
+    bytes_scanned = 0
+    start_time = time.monotonic()
+    timed_out = False
+    limit_reached = False
+
     for base in bases:
+        if timed_out or limit_reached or len(rows) >= limit:
+            break
         for dirpath, dirnames, filenames in os.walk(base, onerror=lambda _err: None):
+            if time.monotonic() - start_time > SEARCH_TIMEOUT_SECONDS:
+                timed_out = True
+                break
             dirnames[:] = [name for name in dirnames if not is_sensitive(pathlib.Path(dirpath) / name)]
             for filename in filenames:
+                if time.monotonic() - start_time > SEARCH_TIMEOUT_SECONDS:
+                    timed_out = True
+                    break
+                if files_scanned >= MAX_SEARCH_FILES or bytes_scanned >= MAX_SEARCH_BYTES:
+                    limit_reached = True
+                    break
                 if len(rows) >= limit:
-                    return result_text("\n".join(rows) or "(no matches)")
+                    break
                 path = pathlib.Path(dirpath) / filename
+                files_scanned += 1
                 if is_sensitive(path):
+                    continue
+                try:
+                    if path.is_symlink():
+                        real_target = path.resolve(strict=False)
+                        if not allowed_root_for(real_target) or is_sensitive(real_target):
+                            continue
+                except (OSError, RuntimeError):
                     continue
                 shown = display_path(path)
                 if query in shown.lower():
                     rows.append(shown)
                     continue
                 try:
+                    stat = path.stat()
+                    if stat.st_size > MAX_READ:
+                        continue
+                    bytes_scanned += stat.st_size
                     text = path.read_text("utf-8", errors="ignore")
                 except Exception:
                     continue
@@ -245,7 +284,18 @@ def search_files(args):
                     line_no = text[:index].count("\n") + 1
                     line = text.splitlines()[line_no - 1][:240] if text.splitlines() else ""
                     rows.append(f"{shown}:{line_no}: {line}")
+            if len(rows) >= limit:
+                break
+
+    notes = []
+    if timed_out:
+        notes.append(f"[search timed out after {SEARCH_TIMEOUT_SECONDS}s]")
+    if limit_reached:
+        notes.append(f"[search limits reached: {files_scanned} files / {bytes_scanned} bytes scanned]")
+    if notes:
+        rows.append(" ".join(notes))
     return result_text("\n".join(rows) or "(no matches)")
+
 
 
 TOOLS = {

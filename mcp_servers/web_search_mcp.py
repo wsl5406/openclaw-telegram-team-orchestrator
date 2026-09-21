@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import html
+import ipaddress
 import json
 import re
+import socket
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -12,6 +15,44 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2MB
+MAX_REDIRECTS = 3
+FORBIDDEN_HOSTS = {
+    "localhost",
+    "metadata.google.internal",
+    "metadata",
+    "instance-data",
+    "kubernetes.default",
+    "kubernetes.default.svc",
+}
+FORBIDDEN_NETWORKS = [
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.0.0.0/24"),
+    ipaddress.ip_network("192.0.2.0/24"),
+    ipaddress.ip_network("192.88.99.0/24"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("198.18.0.0/15"),
+    ipaddress.ip_network("198.51.100.0/24"),
+    ipaddress.ip_network("203.0.113.0/24"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("240.0.0.0/4"),
+    ipaddress.ip_network("255.255.255.255/32"),
+    ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("100::/64"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("ff00::/8"),
+]
+EXTRA_FORBIDDEN_IPS = {
+    "169.254.169.254",  # AWS/GCP/OpenStack/Azure metadata
+    "100.100.100.200",  # Alibaba Cloud metadata
+}
 
 
 def send(msg):
@@ -23,7 +64,75 @@ def result_text(text):
     return {"content": [{"type": "text", "text": text}]}
 
 
+def is_forbidden_ip(ip_obj):
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
+        ip_obj = ip_obj.ipv4_mapped
+    if str(ip_obj) in EXTRA_FORBIDDEN_IPS:
+        return True
+    if ip_obj.is_loopback or ip_obj.is_private or ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_reserved or ip_obj.is_unspecified:
+        return True
+    for net in FORBIDDEN_NETWORKS:
+        if ip_obj in net:
+            return True
+    return False
+
+
+def validate_url_target(url):
+    parsed = urllib.parse.urlparse(url)
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Invalid URL scheme '{scheme}': only http and https are allowed")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("Invalid URL: missing hostname")
+    hostname_lower = hostname.lower()
+    if hostname_lower in FORBIDDEN_HOSTS or hostname_lower.endswith(".local") or hostname_lower.endswith(".internal") or hostname_lower.endswith(".localhost"):
+        raise PermissionError(f"Access to hostname '{hostname}' is blocked")
+
+    # Check direct IP representation
+    try:
+        ip = ipaddress.ip_address(hostname_lower)
+        if is_forbidden_ip(ip):
+            raise PermissionError(f"Access to private/local/metadata IP '{ip}' is blocked")
+    except ValueError:
+        pass
+
+    # Resolve DNS and check all resolved IP addresses
+    port = parsed.port or (443 if scheme == "https" else 80)
+    try:
+        addrinfo = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+        raise ValueError(f"DNS resolution failed for '{hostname}': {exc}")
+
+    for item in addrinfo:
+        sockaddr = item[4]
+        ip_str = sockaddr[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            if is_forbidden_ip(ip):
+                raise PermissionError(f"Access to destination IP '{ip_str}' for host '{hostname}' is blocked")
+        except ValueError:
+            continue
+    return parsed
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, max_redirects=MAX_REDIRECTS):
+        super().__init__()
+        self.max_redirects = max_redirects
+        self.redirect_count = 0
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        self.redirect_count += 1
+        if self.redirect_count > self.max_redirects:
+            raise urllib.error.HTTPError(req.full_url, code, f"Too many redirects (max {self.max_redirects})", headers, fp)
+        validate_url_target(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def fetch_url(url, timeout=12):
+    validate_url_target(url)
+    opener = urllib.request.build_opener(SafeRedirectHandler())
     req = urllib.request.Request(
         url,
         headers={
@@ -31,10 +140,11 @@ def fetch_url(url, timeout=12):
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = resp.read()
+    with opener.open(req, timeout=timeout) as resp:
+        data = resp.read(MAX_RESPONSE_BYTES)
         charset = resp.headers.get_content_charset()
         return decode_bytes(data, charset), resp.geturl()
+
 
 
 def decode_bytes(data, declared_charset=None):
