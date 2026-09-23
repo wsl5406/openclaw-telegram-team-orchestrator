@@ -39,4 +39,4 @@ jobs:
         run: .\scripts\secret_scan.ps1
 
       - name: Dependency audit
-        run: npm audit --omit=dev || true
+        run: npm audit --omit=dev --audit-level=high

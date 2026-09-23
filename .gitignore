@@ -21,3 +21,9 @@ __pycache__/
 Thumbs.db
 nul
 
+clean_session.py
+inspect_session.py
+patch_config.py
+patch_fence.py
+wsl_proxy_relay.js
+
