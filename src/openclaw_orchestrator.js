@@ -19,7 +19,7 @@ const CHAT_STATE = new Map();
 const MESSAGE_DEDUP_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 let isSavingState = false;
-let pendingSaveResolve = null;
+const pendingSaveResolvers = [];
 
 function loadEnvFile() {
   const envPath = path.join(ROOT, ".env");
@@ -155,7 +155,7 @@ function loadState() {
 async function saveState() {
   if (isSavingState) {
     return new Promise((resolve) => {
-      pendingSaveResolve = resolve;
+      pendingSaveResolvers.push(resolve);
     });
   }
   isSavingState = true;
@@ -180,10 +180,9 @@ async function saveState() {
     logEvent("state_save_failed", { error: err.message });
   } finally {
     isSavingState = false;
-    if (pendingSaveResolve) {
-      const resolve = pendingSaveResolve;
-      pendingSaveResolve = null;
-      saveState().then(resolve);
+    if (pendingSaveResolvers.length) {
+      const resolvers = pendingSaveResolvers.splice(0);
+      saveState().then(() => resolvers.forEach((resolve) => resolve()));
     }
   }
 }
