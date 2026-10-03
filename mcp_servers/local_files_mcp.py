@@ -221,7 +221,8 @@ def read_file(args):
     path = checked_path(args["path"])
     if not path.is_file():
         raise FileNotFoundError(str(path))
-    data = path.read_bytes()[:MAX_READ]
+    with path.open("rb") as f:
+        data = f.read(MAX_READ)
     text = data.decode("utf-8", errors="replace")
     if path.stat().st_size > MAX_READ:
         text += f"\n\n[truncated at {MAX_READ} bytes]"
