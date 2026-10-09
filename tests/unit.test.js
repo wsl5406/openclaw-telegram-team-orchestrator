@@ -1,24 +1,30 @@
+const { STATE_FILE, stateBackups, resetStateFiles } = require("./helpers/runtime");
 const { test, describe, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 const { execFileSync } = require("node:child_process");
 
 const ROOT = path.resolve(__dirname, "..");
+const { TEAM } = require("../src/config");
 const {
-  TEAM,
-  MEMBERS,
   normalizeDecision,
   fallbackDecision,
   mentionedAgents,
+  stripMentions,
   isAllMembersCall,
+} = require("../src/routing");
+const {
   claimMessage,
   loadState,
   saveState,
   chatState,
   CHAT_STATE,
   HANDLED_MESSAGES,
-} = require("../src/openclaw_orchestrator.js");
+} = require("../src/state");
+const { parseOpenClawResult } = require("../src/agents");
+const { shouldCoordinate } = require("../src/pipeline");
 
 describe("Unit Tests: Routing & Role Matching", () => {
   test("matches Chinese and English role aliases", () => {
@@ -34,12 +40,27 @@ describe("Unit Tests: Routing & Role Matching", () => {
     assert.ok(mentionedAgents("team lead please coordinate").includes("lead"));
   });
 
+  test("does not match ASCII aliases inside other words", () => {
+    // "pm" is inside "development", "dev" inside "device", "lead" inside "misleading".
+    assert.ok(!mentionedAgents("the development branch is slow").includes("pm"));
+    assert.ok(!mentionedAgents("my device restarted").includes("engineer"));
+    assert.ok(!mentionedAgents("that title is misleading").includes("lead"));
+    assert.ok(mentionedAgents("PM, thoughts?").includes("pm"));
+  });
+
   test("detects all members call in Chinese and English", () => {
     assert.strictEqual(isAllMembersCall("@all 大家出来讨论一下"), true);
+    assert.strictEqual(isAllMembersCall("@all请看一下"), true);
     assert.strictEqual(isAllMembersCall("所有人一起看一下"), true);
     assert.strictEqual(isAllMembersCall("everyone please join the discussion"), true);
     assert.strictEqual(isAllMembersCall("all hands meeting"), true);
     assert.strictEqual(isAllMembersCall("单聊一下"), false);
+    assert.strictEqual(isAllMembersCall("@allen can you check this"), false);
+  });
+
+  test("stripMentions keeps handles that only start with @all", () => {
+    assert.strictEqual(stripMentions("@all ship it"), "ship it");
+    assert.strictEqual(stripMentions("ask @allen"), "ask @allen");
   });
 
   test("fallback routing correctly assigns mode, complexity and roles", () => {
@@ -70,22 +91,71 @@ describe("Unit Tests: Routing & Role Matching", () => {
   });
 });
 
-describe("Unit Tests: Message Deduplication & State Recovery", () => {
-  const testStateFile = path.join(ROOT, "state.json");
+describe("Unit Tests: Message Coordination", () => {
+  const owner = 4242;
+  const group = "-100777";
+  let saved;
 
+  beforeEach(() => {
+    HANDLED_MESSAGES.clear();
+    saved = { masterUserId: TEAM.masterUserId, groupId: TEAM.groupId, usernames: TEAM.members.map((m) => m.username) };
+    TEAM.masterUserId = owner;
+    TEAM.groupId = group;
+    TEAM.members.forEach((m) => { m.username = `${m.id}_bot`; });
+  });
+
+  afterEach(() => {
+    TEAM.masterUserId = saved.masterUserId;
+    TEAM.groupId = saved.groupId;
+    TEAM.members.forEach((m, i) => { m.username = saved.usernames[i]; });
+    resetStateFiles();
+  });
+
+  const message = (id, text, fromId = owner) => ({ chat: { id: Number(group), type: "supergroup" }, message_id: id, from: { id: fromId, is_bot: false }, text });
+
+  test("exactly one bot coordinates an unaddressed group message", () => {
+    const msg = message(1, "hello team");
+    const winners = TEAM.members.filter((m) => shouldCoordinate(m.id, msg));
+    assert.strictEqual(winners.length, 1);
+  });
+
+  test("an @mentioned message is handled once by the mentioned bot, even if redelivered", () => {
+    const msg = message(2, "@qa_bot please verify");
+    assert.strictEqual(shouldCoordinate("pm", msg), false);
+    assert.strictEqual(shouldCoordinate("qa", msg), true);
+    // Telegram can redeliver the same update after a restart; it must not run twice.
+    assert.strictEqual(shouldCoordinate("qa", msg), false);
+  });
+
+  test("ignores messages from anyone other than the owner", () => {
+    assert.strictEqual(shouldCoordinate("lead", message(3, "hi", 999)), false);
+  });
+});
+
+describe("Unit Tests: OpenClaw Output Parsing", () => {
+  test("extracts the reply from JSON even when stderr has noise", () => {
+    const res = {
+      code: 0,
+      stdout: JSON.stringify({ result: { finalAssistantVisibleText: "Design looks fine." } }),
+      stderr: "(node:123) DeprecationWarning: something",
+    };
+    assert.strictEqual(parseOpenClawResult(res), "Design looks fine.");
+  });
+
+  test("throws instead of forwarding error output when OpenClaw exits non-zero", () => {
+    const res = { code: 1, stdout: "", stderr: "Error: agent 'qa' not found" };
+    assert.throws(() => parseOpenClawResult(res), (err) => err.code === "OPENCLAW_EXIT" && /agent 'qa' not found/.test(err.message));
+  });
+});
+
+describe("Unit Tests: Message Deduplication & State Recovery", () => {
   beforeEach(() => {
     HANDLED_MESSAGES.clear();
     CHAT_STATE.clear();
   });
 
   afterEach(() => {
-    if (fs.existsSync(testStateFile)) {
-      try { fs.unlinkSync(testStateFile); } catch {}
-    }
-    const backups = fs.readdirSync(ROOT).filter((f) => f.startsWith("state.json.corrupted-"));
-    for (const b of backups) {
-      try { fs.unlinkSync(path.join(ROOT, b)); } catch {}
-    }
+    resetStateFiles();
   });
 
   test("claimMessage deduplicates repeated messages", () => {
@@ -96,23 +166,32 @@ describe("Unit Tests: Message Deduplication & State Recovery", () => {
   });
 
   test("recovers gracefully from corrupted state.json", async () => {
-    fs.writeFileSync(testStateFile, "{ invalid json content missing brace", "utf8");
+    fs.writeFileSync(STATE_FILE, "{ invalid json content missing brace", "utf8");
     loadState();
     assert.strictEqual(CHAT_STATE.size, 0);
     assert.strictEqual(HANDLED_MESSAGES.size, 0);
-
-    const backups = fs.readdirSync(ROOT).filter((f) => f.startsWith("state.json.corrupted-"));
-    assert.ok(backups.length >= 1, "Corrupted state was backed up");
+    assert.ok(stateBackups().length >= 1, "Corrupted state was backed up");
   });
 
   test("state saves atomically and reloads correctly", async () => {
     chatState("9999").recentTurns = [{ name: "tester", reply: "passed", ts: new Date().toISOString() }];
     await saveState();
 
-    assert.ok(fs.existsSync(testStateFile));
-    const loaded = JSON.parse(fs.readFileSync(testStateFile, "utf8"));
+    assert.ok(fs.existsSync(STATE_FILE));
+    const loaded = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
     assert.ok(loaded.chatState["9999"]);
     assert.strictEqual(loaded.chatState["9999"].recentTurns[0].reply, "passed");
+  });
+
+  test("concurrent saves all resolve and the latest snapshot reaches disk", { timeout: 5000 }, async () => {
+    const saves = [];
+    for (let i = 0; i < 5; i += 1) {
+      chatState("race").counter = i;
+      saves.push(saveState());
+    }
+    await Promise.all(saves);
+    const loaded = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    assert.strictEqual(loaded.chatState.race.counter, 4);
   });
 });
 
@@ -134,7 +213,11 @@ blocked_cases = [
     "C:/secret/auth.token",
     "C:/data/key.pem",
     "C:/data/store.sqlite",
-    "C:/data/wallet.kdbx"
+    "C:/data/wallet.kdbx",
+    "C:/Users/me/AppData/Local/Google/Chrome/User Data/Default/Bookmarks",
+    "C:/Users/me/AppData/Roaming/Mozilla/Firefox/Profiles/x/prefs.js",
+    "home/me/.mozilla/firefox/abc.default/prefs.js",
+    "C:/Users/me/AppData/Local/Microsoft/Edge/User Data/Default/Preferences",
 ]
 
 for p in blocked_cases:
@@ -146,7 +229,8 @@ allowed_cases = [
     "src/index.js",
     "README.md",
     "docs/architecture.md",
-    "package.json"
+    "package.json",
+    "docs/google/chrome-extension-notes.md",
 ]
 
 for p in allowed_cases:
@@ -174,6 +258,26 @@ except ValueError:
 `;
     const result = execFileSync(pythonBin, ["-c", script], { cwd: ROOT, encoding: "utf8" });
     assert.ok(result.includes("PASS_OUTSIDE_ROOT"));
+  });
+
+  test("read_file returns at most OPENCLAW_FILE_MAX_READ bytes and marks truncation", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "local-files-mcp-"));
+    const file = path.join(dir, "big.txt");
+    fs.writeFileSync(file, "x".repeat(5000), "utf8");
+    const script = `
+import sys
+from mcp_servers import local_files_mcp as m
+text = m.read_file({"path": sys.argv[1]})["content"][0]["text"]
+body = text.split("\\n\\n[truncated")[0]
+print("LEN", len(body), "TRUNCATED" if "[truncated at 100 bytes]" in text else "FULL")
+`;
+    const result = execFileSync(pythonBin, ["-c", script, file], {
+      cwd: ROOT,
+      encoding: "utf8",
+      env: { ...process.env, OPENCLAW_FILE_ROOTS: dir, OPENCLAW_FILE_MAX_READ: "100" },
+    });
+    fs.rmSync(dir, { recursive: true, force: true });
+    assert.match(result, /LEN 100 TRUNCATED/);
   });
 });
 

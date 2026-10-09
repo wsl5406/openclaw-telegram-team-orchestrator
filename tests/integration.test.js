@@ -1,23 +1,19 @@
+const { STATE_FILE, stateBackups, resetStateFiles } = require("./helpers/runtime");
 const { test, describe, beforeEach, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
-const path = require("node:path");
 const fs = require("node:fs");
 
+const { spawnAsync } = require("../src/spawn");
+const { TaskQueue } = require("../src/task_queue");
+const { sendLong, splitMessage } = require("../src/telegram");
 const {
-  spawnAsync,
-  TaskQueue,
-  sendLong,
   claimMessage,
-  handleMessage,
   loadState,
   saveState,
   chatState,
   CHAT_STATE,
   HANDLED_MESSAGES,
-} = require("../src/openclaw_orchestrator.js");
-
-const ROOT = path.resolve(__dirname, "..");
-const STATE_FILE = path.join(ROOT, "state.json");
+} = require("../src/state");
 
 describe("Integration Tests: Async Queue & Timeout Handling", () => {
   test("spawnAsync terminates process when timeout is reached", async () => {
@@ -38,7 +34,13 @@ describe("Integration Tests: Async Queue & Timeout Handling", () => {
     assert.ok(elapsed < 3000, `Process should be killed quickly, took ${elapsed}ms`);
   });
 
-  test("OpenClaw 超时后标记 timed_out", async () => {
+  test("spawnAsync survives a child that exits without reading stdin", async () => {
+    // Writing a large payload to a process that exits immediately raises EPIPE on stdin.
+    const res = await spawnAsync(process.execPath, ["-e", "process.exit(0)"], { input: "x".repeat(4 * 1024 * 1024) });
+    assert.strictEqual(res.code, 0);
+  });
+
+  test("marks an OpenClaw timeout as timed_out", async () => {
     const q = new TaskQueue(2);
     let caught = null;
     const taskId = "task-openclaw-timeout";
@@ -66,7 +68,7 @@ describe("Integration Tests: Async Queue & Timeout Handling", () => {
     assert.ok(status.durationMs >= 0);
   });
 
-  test("MCP 出错后标记 failed", async () => {
+  test("marks an MCP error as failed", async () => {
     const q = new TaskQueue(2);
     let caught = null;
     const taskId = "task-mcp-error";
@@ -93,6 +95,17 @@ describe("Integration Tests: Async Queue & Timeout Handling", () => {
     assert.strictEqual(status.error_code, "MCP_ERROR");
     assert.ok(status.error.includes("Tool failure"));
   });
+
+  test("bounds the number of finished task statuses it keeps", async () => {
+    const q = new TaskQueue(1, { maxTrackedTasks: 3 });
+    for (let i = 0; i < 10; i += 1) {
+      await q.enqueue("chat-prune", { taskId: `t${i}`, messageId: i, execute: async () => i });
+    }
+    // Let the final finally() handler run its prune.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(q.taskStatuses.size <= 3, `kept ${q.taskStatuses.size} statuses`);
+    assert.ok(q.getTaskStatus("t9"), "most recent task is still tracked");
+  });
 });
 
 describe("Integration Tests: Telegram Rate Limiting & Retry Backoff", () => {
@@ -117,7 +130,7 @@ describe("Integration Tests: Telegram Rate Limiting & Retry Backoff", () => {
     assert.strictEqual(callCount, 2, "Should retry after 429");
   });
 
-  test("Telegram 发送失败自动重试", async () => {
+  test("retries transient Telegram send failures", async () => {
     let attempts = 0;
     const fakeTransientBot = {
       sendMessage: async () => {
@@ -146,11 +159,29 @@ describe("Integration Tests: Telegram Rate Limiting & Retry Backoff", () => {
     await sendLong(fakeFailingBot, 12345, "A".repeat(5000), { fastRetry: true });
     assert.ok(true, "sendLong caught errors and finished gracefully");
   });
+
+  test("long messages are split without breaking emoji surrogate pairs", async () => {
+    const body = "a".repeat(3799) + "😀" + "b".repeat(10);
+    const chunks = splitMessage(body);
+    assert.strictEqual(chunks.join(""), body);
+    for (const chunk of chunks) {
+      const last = chunk.charCodeAt(chunk.length - 1);
+      assert.ok(!(last >= 0xd800 && last <= 0xdbff), "chunk must not end with a lone high surrogate");
+    }
+
+    const sent = [];
+    await sendLong({ sendMessage: async (_id, text) => sent.push(text) }, 1, body, { fastRetry: true });
+    assert.strictEqual(sent.join(""), body);
+  });
 });
 
 describe("Integration Tests: Multi-Bot & Deduplication", () => {
   beforeEach(() => {
     HANDLED_MESSAGES.clear();
+  });
+
+  afterEach(() => {
+    resetStateFiles();
   });
 
   test("only one bot successfully claims a broadcast message", async () => {
@@ -172,7 +203,7 @@ describe("Integration Tests: Multi-Bot & Deduplication", () => {
     assert.strictEqual(claimedCount, 1, "Exactly one bot should successfully claim the message");
   });
 
-  test("重复消息不会重复执行", async () => {
+  test("does not execute a duplicate message twice", async () => {
     const testMsg = {
       chat: { id: -100222333444 },
       message_id: 55555,
@@ -193,22 +224,14 @@ describe("Integration Tests: Multi-Bot & Deduplication", () => {
 
 describe("Integration Tests: Corrupted State Recovery", () => {
   beforeEach(() => {
-    if (fs.existsSync(STATE_FILE)) {
-      try { fs.unlinkSync(STATE_FILE); } catch {}
-    }
+    resetStateFiles();
   });
 
   afterEach(() => {
-    if (fs.existsSync(STATE_FILE)) {
-      try { fs.unlinkSync(STATE_FILE); } catch {}
-    }
-    const backups = fs.readdirSync(ROOT).filter((f) => f.startsWith("state.json.corrupted-"));
-    for (const b of backups) {
-      try { fs.unlinkSync(path.join(ROOT, b)); } catch {}
-    }
+    resetStateFiles();
   });
 
-  test("损坏状态文件可以恢复", async () => {
+  test("recovers from a corrupted state file", async () => {
     // 1. Write corrupted content into state.json
     fs.writeFileSync(STATE_FILE, "{ bad json structure: incomplete [", "utf8");
 
@@ -218,8 +241,7 @@ describe("Integration Tests: Corrupted State Recovery", () => {
     assert.strictEqual(HANDLED_MESSAGES.size, 0, "HANDLED_MESSAGES must be reset to empty");
 
     // 3. Verify backup file was created
-    const backups = fs.readdirSync(ROOT).filter((f) => f.startsWith("state.json.corrupted-"));
-    assert.ok(backups.length >= 1, "Backup file of corrupted state must exist");
+    assert.ok(stateBackups().length >= 1, "Backup file of corrupted state must exist");
 
     // 4. Save state should now cleanly succeed and create valid JSON
     chatState("recovered-chat-1").recentTurns = [{ name: "lead", reply: "all good" }];

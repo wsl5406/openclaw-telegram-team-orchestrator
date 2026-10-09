@@ -204,11 +204,54 @@ Secret scan passed: 0 potential secrets found.
 - API keys or Telegram tokens
 - Windows reserved-name leftovers such as `nul`
 
+## Design Decisions
+
+The interesting part of this project is not "several bots in a group" but the constraints that shape it.
+
+**1. One process owns every bot, and delivery is centralized.**
+Telegram bots never receive messages sent by other bots, so role bots cannot coordinate peer-to-peer. And when several bots can see the same user message, each one gets its own copy. One orchestrator process therefore receives all copies, picks exactly one coordinator, and sends every role's reply through that role's bot account.
+*Trade-off:* it is a single point of failure, and the in-memory claim map only works within one process. Running more than one instance would need a shared store such as Redis or SQLite.
+
+**2. Claim before work, persisted for 24 hours.**
+Each message is claimed (`chatId:messageId`) before any model call, and the claim is written to `state.json`. Polling redelivers updates that were not yet confirmed when the process crashed, so without a persisted claim a restart could run the same task twice. An explicit `@bot` mention goes through the same claim.
+
+**3. Tasks run serially within a chat, with a global concurrency cap.**
+Inside one group, roles must speak in order, because the engineer reads the PM's output. Across groups, a global cap (`MAX_CONCURRENT_TASKS`) bounds cost and API rate. Every task records a status (`queued → running → succeeded / failed / timed_out`) for observability. Finished statuses are capped, so a long-running process does not leak memory.
+
+**4. A semantic router first, keyword rules as the fallback.**
+An LLM router resolves pronouns ("you two"), requested sequences ("PM, then engineering, then QA"), and the smallest set of roles a message needs. If the router provider is down, keyword rules keep the team responsive. A simple direct ping to one role skips the router entirely to save latency and cost.
+*Trade-off:* keyword rules are brittle. ASCII aliases are matched as whole words, so `pm` does not fire on "development".
+
+**5. Two execution paths: plain chat completion or OpenClaw.**
+Starting an OpenClaw agent through WSL takes seconds. It is only used when a task needs tools (local files or web search); otherwise a role answers through a direct `/chat/completions` call. If OpenClaw exits non-zero without a structured reply, that is treated as an error and never posted to the group as if the agent had said it.
+
+**6. Safety is enforced by what the tools can do, not by prompts.**
+The file MCP has no write, delete, or shell tools at all, so "read-only" holds even if a model ignores instructions. Prompt-level approval rules are a second layer. File access combines a root allowlist with a denylist for secrets, keys, and browser profiles, and reads are size-bounded. The web MCP accepts only http/https, resolves DNS, rejects private, loopback, and cloud-metadata addresses, and re-checks every redirect.
+
+**7. Shared context is small and bounded.**
+Roles share short, capped context files (`current_task`, `handoffs`, `decisions`) and the last few turns, never the full transcript. Token cost stays predictable; the price is that older context is forgotten.
+
+**8. State writes are atomic.**
+State is written to a temp file and then renamed. A corrupted `state.json` is backed up and reset rather than crashing startup or being silently overwritten. Tests point all runtime files at a temp directory (`ORCHESTRATOR_STATE_FILE`, `ORCHESTRATOR_LOG_FILE`, `ORCHESTRATOR_TEAM_CONTEXT_DIR`), so running them never touches a live deployment.
+
+### If I built it again today
+
+The agent ecosystem moved fast while this was being built. OpenClaw now has native per-agent mention routing, there is a community multi-bot relay plugin, and Hermes Agent ships subagent delegation across many chat platforms. A 2026 version would:
+
+- let the model decide when it needs tools or deeper reasoning through native tool calling, instead of regex heuristics;
+- replace fixed role personas with one lead agent that spawns subagents on demand, and keep multiple bot identities only as the presentation layer;
+- ship as a thin OpenClaw or Hermes plugin that adds only multi-identity relay and approval gating, instead of a standalone process;
+- move claims and state to SQLite or Redis so more than one instance can run;
+- pass prompts to OpenClaw through stdin or a file instead of a command-line argument;
+- pin the resolved IP address in the web MCP to close the DNS-rebinding window.
+
 ## Known Limits
 
 - Telegram Bot API does not make bots omniscient; the orchestrator still centralizes message handling.
 - Search quality depends on public search engine availability.
 - OpenClaw agents must be configured separately.
+- Prompts reach OpenClaw as a command-line argument, so very large shared contexts can hit the Windows 32K command-line limit.
+- The web MCP validates the resolved IP before connecting, but urllib resolves DNS again when it connects, so a DNS-rebinding attacker could in theory slip between the two lookups.
 - This is a v0.2.0 template, not a full production framework.
 
 ## License
@@ -424,11 +467,54 @@ Secret scan passed: 0 potential secrets found.
 - API key 或 Telegram token
 - Windows 保留名残留文件，例如 `nul`
 
+## 设计取舍
+
+这个项目真正值得看的不是"群里有几个 Bot"，而是背后的几个约束。
+
+**1. 一个进程管理所有 Bot，统一发送回复。**
+Telegram 的 Bot 收不到其他 Bot 发的消息，所以角色 Bot 之间没法点对点协作。另外，多个 Bot 都能看到同一条用户消息时，每个 Bot 都会各收到一份。因此由一个 Orchestrator 进程接收所有副本，只选出一个协调者，再用各角色自己的 Bot 账号把回复发出去。
+*代价*：这是单点故障；内存里的认领表也只在单进程内有效。要跑多个实例，需要把认领表放到 Redis 或 SQLite 这类共享存储里。
+
+**2. 先认领再干活，认领记录保留 24 小时。**
+每条消息在调用模型之前先认领（`chatId:messageId`），并写入 `state.json`。进程崩溃时还没确认的消息，轮询会重新投递；如果不持久化认领记录，重启后同一个任务可能执行两次。显式 `@bot` 的消息也走同一套认领。
+
+**3. 同一个群内串行执行，全局限制并发。**
+同一个群里，角色必须按顺序发言，因为工程师要先看到 PM 的输出。跨群用全局上限 `MAX_CONCURRENT_TASKS` 控制成本和 API 调用速率。每个任务都记录状态（`queued → running → succeeded / failed / timed_out`），方便观测；已结束的任务状态有数量上限，长期运行不会泄漏内存。
+
+**4. 先用语义路由，关键词规则兜底。**
+LLM 路由负责理解指代（"你们俩"）、用户要求的顺序（"先 PM，再开发，最后 QA"），并选出这条消息最少需要哪些角色。路由模型不可用时，关键词规则保证团队还能回复。只点名一个角色的简单消息直接跳过路由，省时间也省钱。
+*代价*：关键词规则比较脆弱。英文别名按整词匹配，避免 `pm` 被 "development" 误触发。
+
+**5. 两条执行路径：普通对话接口或 OpenClaw。**
+通过 WSL 启动 OpenClaw Agent 要几秒钟，所以只在任务需要工具（读本地文件、联网搜索）时才用；其他情况直接调用 `/chat/completions`。如果 OpenClaw 以非零退出码结束且没有返回结构化回复，就按错误处理，绝不会当成 Agent 的发言发到群里。
+
+**6. 安全靠工具能力本身保证，不靠提示词。**
+文件 MCP 根本没有写入、删除或执行 shell 的工具，所以就算模型不听指令，"只读"也依然成立；提示词里的审批规则只是第二层防线。文件访问同时使用根目录白名单和敏感路径黑名单（密钥、证书、浏览器配置目录），单次读取有大小上限。联网 MCP 只允许 http/https，会先解析 DNS，拒绝内网、回环和云厂商元数据地址，并且每次重定向都重新检查。
+
+**7. 共享上下文小而有界。**
+角色之间只共享几份有长度上限的上下文文件（`current_task`、`handoffs`、`decisions`）和最近几轮发言，不传完整聊天记录。这样 token 成本可控，代价是较早的上下文会被遗忘。
+
+**8. 状态原子写入。**
+先写临时文件，再用 rename 替换。`state.json` 损坏时会先备份再重置，不会导致启动崩溃，也不会被悄悄覆盖。测试通过 `ORCHESTRATOR_STATE_FILE`、`ORCHESTRATOR_LOG_FILE`、`ORCHESTRATOR_TEAM_CONTEXT_DIR` 把所有运行时文件指向临时目录，跑测试永远不会碰到线上部署的数据。
+
+### 如果今天重新做
+
+做这个项目期间，Agent 生态变化很快：OpenClaw 已经原生支持按 Agent 配置 @ 路由，社区有了多 Bot 中转插件，Hermes Agent 也能在多个聊天平台上分派子 Agent。2026 年重做的话，我会：
+
+- 让模型通过原生工具调用自己决定要不要用工具、要不要深度思考，不再用正则启发式判断；
+- 用"一个主 Agent 按需派生子 Agent"取代固定的角色人设，多 Bot 身份只作为展示层保留；
+- 做成 OpenClaw 或 Hermes 的轻量插件，只提供多身份接力和审批这两项能力，不再作为独立进程运行；
+- 把认领记录和状态迁到 SQLite 或 Redis，支持多实例；
+- 通过 stdin 或文件把提示词传给 OpenClaw，而不是命令行参数；
+- 在联网 MCP 里固定已解析的 IP，堵上 DNS rebinding 的窗口。
+
 ## 已知限制
 
 - Telegram Bot API 不会让每个 Bot 自动拥有完整群聊全知视角，仍然需要 Orchestrator 统一调度。
 - 搜索质量依赖公开搜索引擎可用性。
 - OpenClaw Agent 需要单独配置。
+- 提示词以命令行参数形式传给 OpenClaw，共享上下文特别大时可能超过 Windows 32K 的命令行长度限制。
+- 联网 MCP 在连接前会校验解析出的 IP，但 urllib 连接时会再解析一次 DNS，理论上存在 DNS rebinding 的空档。
 - 这是 v0.2.0 模板，不是完整生产级框架。
 
 ## License

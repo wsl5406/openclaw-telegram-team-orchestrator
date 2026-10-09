@@ -37,6 +37,23 @@ flowchart TD
 - MCP file access is read-only by default.
 - The router is semantic-first; fallback rules are only a reliability backup.
 
+## Source Layout
+
+| Module | Responsibility |
+| --- | --- |
+| `src/openclaw_orchestrator.js` | Entry point: startup checks, one polling client per bot |
+| `src/config.js` | `.env` loading, team config, provider config, runtime paths |
+| `src/pipeline.js` | Picks the coordinating bot, then runs route → roles → replies |
+| `src/routing.js` | Mention/alias detection, LLM router, keyword fallback |
+| `src/prompts.js` | Persona loading and per-role prompt assembly |
+| `src/agents.js` | Plain chat-completion path and OpenClaw CLI path |
+| `src/mcp.js` | One-shot MCP calls (web search evidence) |
+| `src/task_queue.js` | Per-chat serial queue with global concurrency cap |
+| `src/state.js` | Message claims, chat state, atomic persistence |
+| `src/team_context.js` | Shared context files and handoff notes |
+| `src/telegram.js` | Chunked sending with retry and 429 backoff |
+| `src/spawn.js`, `src/providers.js`, `src/logger.js`, `src/util.js` | Process, HTTP, logging, and string helpers |
+
 ## Runtime Files
 
 Generated files are intentionally ignored by Git:
@@ -53,4 +70,4 @@ Generated files are intentionally ignored by Git:
 - Add roles in `config/team.json`.
 - Add private persona files in `personas/*.md`.
 - Add new MCP servers through OpenClaw config.
-- Adjust routing by editing the router system prompt in `src/openclaw_orchestrator.js`.
+- Adjust routing by editing the router system prompt in `src/routing.js`.

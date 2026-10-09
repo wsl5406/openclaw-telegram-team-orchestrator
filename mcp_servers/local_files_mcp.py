@@ -50,14 +50,19 @@ DENY_PARTS = {
     ".backup",
     ".bak",
     "credentials",
-    "google/chrome",
-    "mozilla/firefox",
-    "microsoft/edge",
     "brave-browser",
     "session storage",
     "indexeddb",
     "local storage",
 }
+# Multi-segment directories (browser profiles). A single path part can never equal "google/chrome",
+# so these are matched against the joined path instead.
+DENY_PATH_SEGMENTS = (
+    "google/chrome",
+    "mozilla/firefox",
+    ".mozilla/firefox",
+    "microsoft/edge",
+)
 DENY_NAMES = {
     ".env",
     ".env.local",
@@ -150,10 +155,13 @@ def allowed_root_for(path):
 
 
 def is_sensitive(path):
-    lower_parts = {part.lower() for part in path.parts}
+    parts = [part.lower() for part in path.parts]
     name = path.name.lower()
     suffix = path.suffix.lower()
-    if bool(lower_parts & DENY_PARTS):
+    if DENY_PARTS.intersection(parts):
+        return True
+    joined = "/" + "/".join(parts) + "/"
+    if any(f"/{segment}/" in joined for segment in DENY_PATH_SEGMENTS):
         return True
     if name in DENY_NAMES:
         return True
@@ -221,9 +229,12 @@ def read_file(args):
     path = checked_path(args["path"])
     if not path.is_file():
         raise FileNotFoundError(str(path))
-    data = path.read_bytes()[:MAX_READ]
+    size = path.stat().st_size
+    # Read at most MAX_READ bytes; read_bytes() would load a multi-GB file fully into memory first.
+    with path.open("rb") as fh:
+        data = fh.read(MAX_READ)
     text = data.decode("utf-8", errors="replace")
-    if path.stat().st_size > MAX_READ:
+    if size > MAX_READ:
         text += f"\n\n[truncated at {MAX_READ} bytes]"
     return result_text(text)
 
