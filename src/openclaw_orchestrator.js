@@ -38,6 +38,10 @@ async function main() {
       logEvent("message_failed", { role_id: member.id, error: err.message });
       console.error(err);
     }));
+    bots[member.id].on("polling_error", (err) => {
+      logEvent("polling_error", { role_id: member.id, error: err.message });
+      console.error(`[polling_error] ${member.name} (${member.id}):`, err.message);
+    });
     console.log(`started ${member.name} (${member.id})`);
   }
   console.log("Telegram team orchestrator is running.");
